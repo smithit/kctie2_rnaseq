@@ -1,0 +1,99 @@
+---
+title: "KCTie2 RNA Seq Exploratory Data Analysis"
+output: html_notebook
+---
+
+# Loading packages
+
+```{r}
+library(tidyverse)
+library(BiocManager)
+```
+
+# Loading Data
+
+```{r}
+counts <- read.csv("data/2024_04_10/kctie2_rnaseq_counts.csv")
+```
+
+# Cleaning Data
+
+```{r}
+head(counts)
+```
+
+This dataset has the first column "gene_ID" where every row in this gene expression matrix corresponds to a different gene. Every other column corresponds to a sample (control/WT or KCTie2) and contains counts for every gene.
+
+## Converting Gene ID to Gene Name
+
+Currently, the "gene_ID" column contains each gene in the Ensembl gene ID format. I want to convert this to standard gene names.
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("biomaRt")
+```
+
+```{r}
+library(biomaRt)
+
+# Extarct mouse genome dataset from Ensembl
+mart <- useDataset("mmusculus_gene_ensembl", 
+                   useMart("ensembl"))
+
+# Create a character vector of the gene IDs to be pulled from Ensembl dataset
+genes_ensembl <- counts$gene_ID
+
+# Extract the Ensembl gene ID and gene name of the genes included in the counts dataset
+gene_names <- getBM(filters= "ensembl_gene_id", 
+                    attributes= c("ensembl_gene_id","mgi_symbol"),
+                    values = genes_ensembl, 
+                    mart = mart)
+
+# Rename gene ID column in counts to match 
+counts <- counts %>%
+  rename(ensembl_gene_id = gene_ID)
+
+# Join gene names with counts data set by enesembl gene id
+counts_final <- left_join(counts, gene_names, by = "ensembl_gene_id")
+
+# Reorder to have gene name next to gene ID
+counts_final <- counts_final %>%
+  rename(gene_name = mgi_symbol) %>%
+  relocate(gene_name, .after = ensembl_gene_id)
+```
+
+## Renaming samples
+
+```{r}
+
+```
+
+## Creating metadata (??)
+
+```{r}
+# Create a character vector containing the column names of counts dataset
+cols <- colnames(counts_final)
+
+# Subset vector to include only samples (samples start with letter X)
+samples <- cols[grep("^[X].*", cols)]
+
+# Create a dataframe containing original sample ID, sample #, and condition
+samples_df <- as.data.frame(samples)
+
+samples_df <- samples_df %>%
+  mutate(sample_num = case_when(
+    str_detect(sample, "ZC\\.(\\d+)_S1") ~ as.numeric(str_extract(sample,"(?<=ZC\\.)(\\d+)(?=_S1)")))
+
+```
+
+# EDA
+
+## Checking for missing values
+
+```{r}
+
+```
+
+## Visualizing distribution of values
