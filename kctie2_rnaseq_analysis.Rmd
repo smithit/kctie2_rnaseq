@@ -8,12 +8,13 @@ output: html_notebook
 ```{r}
 library(tidyverse)
 library(BiocManager)
+library(readr)
 ```
 
 # Loading Data
 
 ```{r}
-counts <- read.csv("data/2024_04_10/kctie2_rnaseq_counts.csv")
+counts <- read_csv("data/2024_04_10/kctie2_rnaseq_counts.csv")
 ```
 
 # Cleaning Data
@@ -29,10 +30,10 @@ This dataset has the first column "gene_ID" where every row in this gene express
 Currently, the "gene_ID" column contains each gene in the Ensembl gene ID format. I want to convert this to standard gene names.
 
 ```{r}
-if (!require("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
+#if (!require("BiocManager", quietly = TRUE))
+   # install.packages("BiocManager")
 
-BiocManager::install("biomaRt")
+#BiocManager::install("biomaRt")
 ```
 
 ```{r}
@@ -64,31 +65,62 @@ counts_final <- counts_final %>%
   relocate(gene_name, .after = ensembl_gene_id)
 ```
 
-## Renaming samples
-
-```{r}
-
-```
-
-## Creating metadata (??)
+## Creating metadata dataframe
 
 ```{r}
 # Create a character vector containing the column names of counts dataset
 cols <- colnames(counts_final)
 
 # Subset vector to include only samples (samples start with letter X)
-samples <- cols[grep("^[X].*", cols)]
+samples <- cols[grep("^[9].*", cols)]
 
 # Create a dataframe containing original sample ID, sample #, and condition
 samples_df <- as.data.frame(samples)
 
+  # Extract sample # from the sample ID 
 samples_df <- samples_df %>%
-  mutate(sample_num = case_when(
-    str_detect(sample, "ZC\\.(\\d+)_S1") ~ as.numeric(str_extract(sample,"(?<=ZC\\.)(\\d+)(?=_S1)")))
+  mutate(sample_num = 
+           case_when(
+             str_detect(samples, "ZC-\\d+_S1") ~ as.numeric(
+               str_extract(samples,"(?<=ZC-)\\d+(?=_S1)"))))
+
+  # Extract the condition from the sample ID and code condition as a factor
+samples_df <- samples_df %>%
+  mutate(condition = case_when(
+    str_detect(samples, "_control") ~ as.factor("Control"),
+    str_detect(samples, "_KCTie2") ~ as.factor("KCTie2")))
+
+  # Assign row names of metadata dataframe
+rownames(samples_df) <- samples
+```
+
+# **Matching metadata and counts data**
+
+To perform any analysis with DESeq2, we need to create a DESeq2 object by providing the raw counts, metadata, and design formula. To do this, we need to read in the raw counts data and associated metadata we created previously, make sure the sample names are in the same order in both datasets, then create a DESeq2 object to use for differential expression analysis. We will use the design formula `~ condition` to test for differential expression between conditions (normal and fibrosis).
+
+```{r}
 
 ```
 
 # EDA
+
+## How many genes are we working with?
+
+```{r}
+nrow(counts)
+```
+
+The number of rows corresponds to the number of genes in the counts expression matrix = 17,550 genes
+
+## How many samples from each condition?
+
+```{r}
+samples_df %>%
+  group_by(condition) %>%
+  summarise(n = n())
+```
+
+3 control samples and 3 KCTie2 samples.
 
 ## Checking for missing values
 
