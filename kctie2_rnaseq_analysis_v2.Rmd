@@ -1,0 +1,346 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Loading packages
+
+```{r,message=FALSE,results='hide'}
+library(tidyverse)
+library(BiocManager)
+library(readr)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+```
+
+# Loading Data
+
+```{r}
+counts_raw <- read.delim("data/KC-Tie2_kidney_Gene_counts.txt", header = TRUE, sep = "\t", dec = ".")
+
+sample_metadata <- read.delim("data/KC-Tie2_kidney_sample_attributes.txt", header = TRUE, sep = "\t", dec = ".")
+```
+
+# Reshaping Data
+
+```{r}
+# Remove the first two columns containing annotations - sample name and genotype
+counts_data <- counts_raw[,-(1)]
+
+# Store Ensembl Gene ID as rownames
+gene_IDs <- colnames(counts_data)
+
+# Transpose counts matrix 
+counts_data <- t(counts_data)
+
+# Add sample IDs as column names 
+colnames(counts_data) <- counts_raw[,1]
+
+# Now I have the raw counts matrix in the format of each row contains a gene and each column contains a sample 
+head(counts_data,2)
+```
+
+```{r}
+# Making sample metadata into correct matrix format
+rownames(sample_metadata) <- sample_metadata[,1]
+
+sample_metadata <- sample_metadata %>%
+  select(!Sample.name)
+```
+
+Examine the count matrix and column data to see if they are consistent in terms of sample ID:
+
+```{r}
+all(rownames(sample_metadata) %in% colnames(counts_data))
+```
+
+Examine the count matrix and column data to see if they are consistent in terms of sample order:
+
+```{r}
+all(rownames(sample_metadata) == colnames(counts_data))
+```
+
+Reorder columns of count matrix to be the same as the order of samples in metadata:
+
+```{r}
+counts_data <- counts_data[, rownames(sample_metadata)]
+
+all(rownames(sample_metadata) == colnames(counts_data))
+```
+
+# Creating DESeq Object
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = round(counts_data),
+                              colData = sample_metadata,
+                              design = ~ Genotype)
+dds
+```
+
+## Normalization 
+
+Calculating size factors used for normalization using the `estimateSizeFactors()` function and viewing using the `sizeFactors()` function:
+
+```{r}
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+```
+
+### Extracting normalized counts
+
+```{r}
+normalized_counts_data <- counts(dds, normalized = TRUE)
+```
+
+# Exploratory Data Analysis 
+
+## Unsupervised Clustering 
+
+### Hierarchical Heat map Analysis
+
+When using these visualization methods, we should first log transform the normalized counts to improve the visualization of the clustering. For RNA-Seq data, DESeq2 uses a variance stabilizing transformation (VST), which is a logarithmic transformation that moderates the variance across the mean. We can transform the normalized counts by using the DESeq2 vst() function on the DESeq2 object. The blind=TRUE argument specifies that the transformation should be blind to the sample information given in the design formula; this argument should be specified when performing quality assessment.
+
+```{r}
+# log transform the normalized counts
+log_dds <- vst(dds, blind = TRUE)
+```
+
+Hierarchical clustering with heatmaps is used to assess the similarity in gene expression between the different samples in a dataset. This technique is used to explore how similar replicates are to each other and whether the samples belonging to different sample groups cluster separately. The heatmap is created by using the gene expression correlation values for all pairwise combinations of samples in the dataset, with the value 1 being perfect correlation. The hierarchical tree shows which samples are more similar to each other and the colors in the heatmap depict the correlation values. We expect the biological replicates to cluster together and sample conditions to cluster apart. Since the majority of genes should not be differentially expressed, samples should generally have high correlations with each other.
+
+```{r}
+# Extract the vst matrix (containing log-transformed count values) from the DESeq object
+log_dds_mat <- assay(log_dds)
+
+# Compute correlation matrix 
+log_dds_cor <- cor(log_dds_mat)
+
+# Plot heatmap
+pheatmap(log_dds_cor, annotation = select(sample_metadata, Genotype))
+```
+
+-   There is one KC-Tie2 sample 12 that does not cluster with the other 2 samples, and instead clusters with the WT sample. Sample 12 could represent an outlier.
+
+-   All samples have a relatively high correlation value (\>0.986), which is expected since the majority of genes should not be deferentially expressed.
+
+### Principal Component Analysis (PCA)
+
+We can perform PCA using DESeq2's plotPCA() function to plot the first two PCs. This function takes as input the transformed vsd object, and we can use the intgroup argument to specify what factor in the metadata to use to color the plot. We can see that the sample groups, normal and fibrosis, separate well on PC1. This means that our condition corresponds to PC1, which represents 88% of the variance in our data, while 4% is explained by PC2. This is great since it seems that a lot of the variation in gene expression in the dataset can likely be explained by the differences between sample groups. However, if the samples do not separate by PC1 or PC2, the effect of the condition could be small or there are sometimes other larger sources of variation present. You can color the PCA by other factors, such as age, sex, batch, etcetera, to identify other major sources of variation that could correspond to one of the large principal components. We'll talk later about how we can account for these sources of variation in the model. Just to note, if you would like to explore PCs other than PC1 or PC2, the prcomp() base function allows a more thorough analysis of PCs.
+
+```{r}
+# Plot PCA
+plotPCA(log_dds, intgroup = "Genotype") +
+  theme_light()
+```
+
+-   PC1 explains 62% of the variance
+
+-   KC-Tie2 samples and WT samples separate decently well by PC1
+
+-   There may be other sources of variance to explore
+
+# Differential Expression Analysis
+
+The differential expression analysis with DESeq2 consists of roughly three steps: fitting the raw counts for each gene to the DESeq2 negative binomial model and testing for differential expression, shrinking the log2 fold changes, and extracting and visualizing the results.
+
+## Run DEA
+
+```{r}
+# Run DE analysis
+dds <- DESeq(dds)
+```
+
+### Exploring how well our data fit the model
+
+The goal of the differential expression analysis is to determine whether a gene's mean expression between sample groups is different given the variation within groups. This is determined by testing the probability of the log2 fold changes between groups being significantly different from zero. The log2 fold changes are found by the log of the one sample group mean, shown here as the treatment group, divided by the mean of the other sample group, shown here as the control group. Therefore, to model the counts requires information about the mean and variation in the data. To explore the variation in our data, we will observe the variance in gene expression relative to the mean. Variance is the square of the standard deviation, representing how far away the expression of the individual samples, as shown by the dark red and blue circles, are from the means, shown in pink and light blue.
+
+For RNA-Seq data, the variance is generally expected to increase with the gene's mean expression. To observe this relationship, we can calculate the means and variances for every gene of the normal samples using the apply() function.
+
+```{r,warning=FALSE}
+# Calculating mean for each gene (each row) of only WT samples 
+mean_counts <- apply(counts_data[,1:3], 1, mean)
+
+# Calculating varaince for each gene (each row) of only WT samples
+var_counts <- apply(counts_data[,1:3], 1, var)
+
+# Creating df with mean and variance for each gene
+df_mean_var <- data.frame(mean_counts, var_counts)
+
+# Plotting
+ggplot(df_mean_var) +
+  geom_point(aes(x = mean_counts, y = var_counts)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Mean counts per gene",
+       y = "Variance per gene") +
+  theme_light()
+```
+
+We see the variance in gene expression increases with the mean. This is expected for RNA-Seq data. Also, note how the range in values for variance is greater for lower mean counts than higher mean counts. This is also expected for RNA-Seq count data. A measure of the variance for a given mean is described by a metric called dispersion in the DESeq2 model. The DESeq2 model uses dispersion to assess the variability in expression when modeling the counts.
+
+#### Dispersion
+
+To plot the dispersions relative to the means for each gene, we can use the plotDispEsts() function on the DESeq2 object. Each black dot is a gene with associated mean and dispersion values. We expect dispersion values to decrease with increasing mean, which is what we see. With only a few replicates for RNA-Seq experiments, gene-wise estimates of dispersion are often inaccurate, so DESeq2 uses information across all genes to determine the most likely estimates of dispersion for a given mean expression value, shown with the red line in the figure. Genes with inaccurately small estimates of variation could yield many false positives, or genes that are identified as DE, when they are really not. Therefore, the original gene-wise dispersion estimates, shown as the black dots in the figure, are shrunken towards the curve to yield more accurate estimates of dispersion, shown as blue dots. The more accurate, shrunken dispersion estimates are used to model the counts for determining the differentially-expressed genes. Extremely high dispersion values, shown surrounded by blue circles, are not shrunken, due to the likelihood that the gene may have higher variability than others for biological or technical reasons and reducing the variation could result in false positives. The strength of the shrinkage is dependent on the distance from the curve and sample size. Larger numbers of replicates can estimate the mean and variation more accurately, so yield less shrinkage.
+
+```{r}
+# Plot dispersion estimates
+plotDispEsts(dds)
+```
+
+Worrisome plots would include a cloud of data that doesn't follow the curve or dispersions that don't decrease with increasing mean. These problems can often be explained by sample outliers or contamination. Examples of worrisome dispersion plots are shown in the figures.
+
+-   My plot looks ok
+
+-   The assumptions of DESeq2 are met since the dispersions decrease with increasing mean and the raw dispersions seem to cluster around the maximum likelihood line.
+
+## Extracting DEA Results
+
+```{r}
+# Extract all results
+dds_results <- results(dds)
+```
+
+## Log2 Fold-Change Shrinkage 
+
+```{r}
+# Perform log2 fold-change shrinkage on results of DEA
+dds_results <- lfcShrink(dds,
+                         coef = "Genotype_KC.Tie2_vs_WT",
+                         res = dds_results) 
+```
+
+## Exploring Results
+
+```{r}
+mcols(dds_results)
+```
+
+-   In DESeq2 the FDR-corrected p-values are called padj
+
+-   DESeq2 performs multiple test correction using the Benjamini--Hochberg (BH) procedure as the default FDR method
+
+```{r}
+head(dds_results,10)
+```
+
+```{r}
+# summary() provides the number of differentially-expressed genes
+summary(dds_results)
+```
+
+### Annotate with Gene Names and Descriptions 
+
+```{r}
+#install.packages("devtools")
+#devtools::install_github("stephenturner/annotables")
+
+library(annotables)
+
+# Convert results matrix to a df and change row names (genes) to a column
+dds_results_all <- data.frame(dds_results) %>%
+  rownames_to_column(var = "ensgene") 
+
+# Merge results with gene names and descriptions 
+dds_results_all <- left_join(
+                        x = dds_results_all,
+                        y = grcm38[,c("ensgene","symbol","description")],
+                        by = "ensgene")
+
+head(dds_results_all,2)
+```
+
+### Extract Signficant DE Genes
+
+```{r}
+# Extract all genes with padj < 0.05
+dds_results_signif <- subset(dds_results_all, padj < 0.05)
+dds_results_signif <- dds_results_signif %>%
+  arrange(padj)
+
+# Look at the top-10 most signicant DE genes
+head(dds_results_signif,10)
+```
+
+## Visualizing DEA Results
+
+### Expression Heatmap
+
+```{r}
+# Subset normalized counts to signficant genes
+sig_norm_counts <- normalized_counts_data[dds_results_signif$ensgene,]
+
+# Choose color palette from RColorBrewer
+heat_colors <- brewer.pal(6, "RdYlBu")
+
+# Run pheatmap
+pheatmap(sig_norm_counts,
+         color = heat_colors,
+         cluster_rows = T,
+         show_rownames = F,
+         annotation = select(sample_metadata, Genotype),
+         scale = "row")
+```
+
+### Volcano Plot
+
+```{r,warning=FALSE}
+# Obtain logical vector regarding whether padj values are less than 0.05
+dds_results_all <- dds_results_all %>%
+  mutate(threshold = padj < 0.05) 
+  
+dds_results_all <- dds_results_all %>% 
+  mutate(Expression = case_when(
+    (log2FoldChange > 0 & padj <= 0.05) ~ "Up-regulated", 
+    (log2FoldChange < 0 & padj <= 0.05) ~ "Down-regulated", 
+    TRUE ~ "Unchanged"))
+
+# Making volcano plot
+volcano_plot <- ggplot(dds_results_all) +
+  geom_point(aes(x = log2FoldChange,
+                 y = -log(padj,10),
+                 color = Expression),
+             size = 3/4) +
+  xlab(expression("log"[2]*"FC")) + 
+  ylab(expression("-log"[10]*"FDR")) +
+  scale_color_manual(values = c("dodgerblue3", "gray50", "firebrick3")) +
+  guides(colour = guide_legend(override.aes = list(size=1.5))) 
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25)))
+
+volcano_plot
+```
+
+### Plotting Top-20 Differentially Expressed Genes
+
+```{r}
+top_20_de_genes <- data.frame(sig_norm_counts)[1:20,] %>%
+  rownames_to_column(var = "ensgene")
+
+top_20_de_genes <- left_join(x = top_20_de_genes,
+                             y = grcm38[,c("ensgene","symbol","description")],
+                        by = "ensgene") %>%
+  select(!description)
+
+top_20_de_genes <- gather(top_20_de_genes,
+                          key = "samplename",
+                          value = "normalized_counts",
+                          2:7)
+
+#top_20_de_genes <- inner_join(top_20_de_genes,
+ #                             rownames_to_column(sample_metadata,
+  #                                               var = "samplename"),
+   #                           by = "samplename")
+```
+
+```{r}
+ggplot(top_20_de_genes) +
+  geom_point(aes(x = ensgene,
+                 y = normalized_counts,
+                 color = Genotype)) +
+  scale_y_log10() +
+  xlab("Genes") +
+  ylab("Normalized Counts") +
+  ggtitle("Top 20 Signficant Differentially-Expressed Genes")
+```
